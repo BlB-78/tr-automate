@@ -103,11 +103,21 @@ KEYWORDS = re.compile(
     re.I,
 )
 
+# Titles dropped before the per-source cap is applied (routine or off-topic items).
+OFFICIAL_NOISE = re.compile(
+    r"\b(accounts?|money stock|bonds? held|CV and questionnaire|simulation|banknotes?|"
+    r"payment systems?|supervis\w*|discount rate|market operations|tripartite|"
+    r"money markets? committee|consultation)\b",
+    re.I,
+)
+OTHER_PAIRS = re.compile(r"\b(?:AUD|NZD|CAD|CHF|CNH|SEK|NOK)\b|\b(?:GBP/JPY|EUR/JPY|EUR/GBP)\b", re.I)
+SKIP_BY_SOURCE = {"Action Forex": OTHER_PAIRS}
+
 # Which central bank items are worth reading in full (matched against the title).
 OFFICIAL_FOCUS = re.compile(
     r"monetary|policy|interest rates?|bank rate|inflation|fomc|mpc|governing council|outlook|"
     r"projections?|minutes|statement|press conference|speech|remarks|testimony|interview|"
-    r"economic|economy",
+    r"economic|economy|meeting",
     re.I,
 )
 
@@ -294,14 +304,14 @@ def clean_text(s, limit=220):
     return s if len(s) <= limit else s[: limit - 3].rstrip() + "..."
 
 
-def parse_feed(content, max_items, filtered, now_utc):
+def parse_feed(content, max_items, filtered, now_utc, skip=None):
     """Raw RSS/Atom bytes -> [(published_utc_or_None, title, summary, link), ...], newest first."""
     feed = feedparser.parse(content)
     cutoff = now_utc - timedelta(hours=NEWS_HOURS)
     items = []
     for entry in feed.entries:
         title = clean_text(entry.get("title"), 200)
-        if not title:
+        if not title or (skip and skip.search(title)):
             continue
         summary = clean_text(entry.get("summary") or entry.get("description"), 220)
         core = re.sub(r"\s+[-|]\s+[^-|]+$", "", title)  # headline without a trailing " - Publisher"
@@ -328,7 +338,8 @@ def fetch_news(now):
     for name, url, max_items, filtered, official in NEWS_SOURCES:
         try:
             r = http_get(url, timeout=25)
-            items = parse_feed(r.content, max_items, filtered, now_utc)
+            skip = OFFICIAL_NOISE if official else SKIP_BY_SOURCE.get(name)
+            items = parse_feed(r.content, max_items, filtered, now_utc, skip)
         except Exception as e:
             print(f"News feed failed: {name}: {describe(e)}", file=sys.stderr)
             failed.append(f"{name} ({describe(e)})")
@@ -509,32 +520,47 @@ def candidate_models(key):
     return models[:MAX_MODELS]
 
 
+GEMINI_DEADLINE_S = 330  # total time budget for the AI step, so a slow day cannot hit the 10-minute workflow limit
+
+
 def call_gemini(prompt):
     key = os.environ["GEMINI_API_KEY"]
+    deadline = time.monotonic() + GEMINI_DEADLINE_S
     errors = []
     for model in candidate_models(key):
+        if time.monotonic() > deadline:
+            errors.append("time budget used up")
+            break
         url = f"{API_ROOT}/models/{model}:generateContent"
         body = {
             "contents": [{"parts": [{"text": prompt}]}],
             # the limit includes the model's internal "thinking" tokens, so it is generous
             "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192},
         }
-        status, r = 0, None
+        status, r, no_answer = 0, None, False
         for attempt in range(3):
-            r = requests.post(
-                url,
-                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                json=body,
-                timeout=120,
-            )
+            try:
+                r = requests.post(
+                    url,
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json=body,
+                    timeout=(15, 100),  # 15 s to connect, 100 s to wait for the answer
+                )
+            except (requests.Timeout, requests.ConnectionError) as e:
+                print(f"{model}: {describe(e)}, trying the next model", file=sys.stderr)
+                no_answer = True
+                break
             status = r.status_code
-            if status in (429, 500, 502, 503, 504) and attempt < 2:
+            if status in (429, 500, 502, 503, 504) and attempt < 2 and time.monotonic() < deadline - 40:
                 wait = (10, 25)[attempt]
                 print(f"{model}: HTTP {status}, retrying in {wait}s", file=sys.stderr)
                 time.sleep(wait)
                 continue
             break
 
+        if no_answer:
+            errors.append(f"{model}: no answer in time")
+            continue
         if status in (403, 404, 429) or status >= 500:
             errors.append(f"{model}: HTTP {status}")
             print(f"{model}: HTTP {status}, trying the next model", file=sys.stderr)
@@ -554,18 +580,25 @@ def call_gemini(prompt):
 
     raise RuntimeError(
         "Gemini failed - " + "; ".join(errors or ["no model tried"]) + ". "
-        "HTTP 503 means Google's servers are busy; run the workflow again later."
+        "HTTP 503 or a timeout means Google's servers are busy; run the workflow again later."
     )
 
 
-def build_fallback(exc, calendar_text, news_text):
-    """What gets sent when the AI step fails: the raw data, so the run is not wasted."""
-    top_news = "\n".join(news_text.splitlines()[:30])
+def build_fallback(exc, calendar_text, news_text, markets_text):
+    """What gets sent when the AI step fails: the data the script collected, so the run is not wasted."""
+    per_source, picked = {}, []
+    for line in news_text.splitlines():  # at most 3 headlines per source, so every source shows up
+        m = re.match(r"\[([^\]]+)\]", line)
+        name = m.group(1) if m else "other"
+        if per_source.get(name, 0) < 3:
+            per_source[name] = per_source.get(name, 0) + 1
+            picked.append(line)
     return (
         f"AI SUMMARY UNAVAILABLE ({str(exc)[:300]})\n"
         "Raw data instead:\n\n"
+        f"KEY PRICE LEVELS\n{markets_text}\n\n"
         f"ECONOMIC CALENDAR\n{calendar_text}\n\n"
-        f"TOP HEADLINES\n{top_news}"
+        f"TOP HEADLINES\n" + "\n".join(picked[:30])
     )
 
 
@@ -627,7 +660,7 @@ def main():
     except Exception as exc:
         print(f"Gemini failed: {exc}", file=sys.stderr)
         problems.append("Gemini AI summary")
-        analysis = build_fallback(exc, calendar_text, news_text)
+        analysis = build_fallback(exc, calendar_text, news_text, markets_text)
 
     title = "WEEKLY BRIEF" if MODE == "weekly" else "DAILY BRIEF"
     footer = "AI-generated scenarios for context, not trade signals."
