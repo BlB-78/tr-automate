@@ -19,6 +19,7 @@ import sys
 import time
 from calendar import timegm
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -56,6 +57,13 @@ MARKETS = {
     "US Dollar Index (DXY)": (["DX-Y.NYB"], 3),
 }
 
+def gnews(query):
+    """Google News RSS search: headlines (with the publisher's name) for a query, newest first."""
+    when = "7d" if MODE == "weekly" else "2d"
+    return ("https://news.google.com/rss/search?q=" + quote_plus(f"{query} when:{when}")
+            + "&hl=en-US&gl=US&ceid=US:en")
+
+
 # (name, RSS url, max items kept, keyword_filter, official)
 # keyword_filter=True keeps only headlines that mention macro/market keywords
 #   (used for general news sites so unrelated stories are dropped).
@@ -69,9 +77,11 @@ NEWS_SOURCES = [
     ("Bank of England - news", "https://www.bankofengland.co.uk/rss/news", 6, False, True),
     ("Bank of England - speeches", "https://www.bankofengland.co.uk/rss/speeches", 4, False, True),
     ("Bank of Japan - what's new", "https://www.boj.or.jp/en/rss/whatsnew.xml", 6, False, True),
-    # forex-focused news and analysis
-    ("FXStreet - news", "https://www.fxstreet.com/rss/news", 20, False, False),
-    ("FXStreet - analysis", "https://www.fxstreet.com/rss/analysis", 8, False, False),
+    # forex-focused news and analysis (FXStreet was removed: it answers 403 to GitHub's servers)
+    ("Action Forex", "https://www.actionforex.com/feed/", 12, False, False),
+    ("MarketPulse (OANDA)", "https://www.marketpulse.com/feed/", 10, False, False),
+    ("Google News - forex", gnews('forex OR "EUR/USD" OR "GBP/USD" OR "USD/JPY"'), 12, False, False),
+    ("Google News - gold, Fed, yields", gnews('"gold price" OR "Federal Reserve" OR "Treasury yields"'), 12, False, False),
     # general economy / markets news
     ("CNBC - economy", "https://www.cnbc.com/id/20910258/device/rss/rss.html", 8, True, False),
     ("BBC - business", "https://feeds.bbci.co.uk/news/business/rss.xml", 8, True, False),
@@ -193,6 +203,65 @@ def format_events(chosen, cap=80):
 
 # -------------------------------------------------------------------- prices
 
+def where(price, low, high, dp, label):
+    if price > high:
+        return f"above the {label} high by {price - high:.{dp}f}"
+    if price < low:
+        return f"below the {label} low by {low - price:.{dp}f}"
+    return f"inside the {label} range"
+
+
+def format_levels(name, ticker, daily, weekly, dp, today=None):
+    """Key levels worked out here in code (not by the AI): last price, today so far,
+    previous day, this week so far and previous week."""
+    def f(x):
+        return f"{float(x):.{dp}f}"
+
+    tz = daily.index.tz
+    today = today or (datetime.now(tz) if tz else datetime.now()).date()
+    price = float(daily["Close"].iloc[-1])
+
+    live_day = daily.index[-1].date() == today  # the last candle is today's and still forming
+    today_row = daily.iloc[-1] if live_day else None
+    pd_pos = -2 if live_day else -1
+    prev_day = daily.iloc[pd_pos] if len(daily) >= abs(pd_pos) else None
+
+    this_week = prev_week = None
+    prev_week_label = ""
+    if not weekly.empty:
+        start_day = weekly.index[-1].date()
+        live_week = today.weekday() < 5 and 0 <= (today - start_day).days < 5  # Mon-Fri of the week in progress
+        this_week = weekly.iloc[-1] if live_week else None
+        pw_pos = -2 if live_week else -1
+        if len(weekly) >= abs(pw_pos):
+            prev_week = weekly.iloc[pw_pos]
+            prev_week_label = f"week of {weekly.index[pw_pos]:%d %b}"
+
+    lines = [f"{name} [{ticker}]", f"  Last price: {f(price)}"]
+    if today_row is not None:
+        lines.append(
+            f"  Today so far: open {f(today_row['Open'])} | high {f(today_row['High'])} | low {f(today_row['Low'])}"
+        )
+    if prev_day is not None:
+        lines.append(
+            f"  Previous day ({daily.index[pd_pos]:%a %d %b}): high {f(prev_day['High'])} | "
+            f"low {f(prev_day['Low'])} | close {f(prev_day['Close'])}"
+        )
+        lines.append(f"    Price is {where(price, prev_day['Low'], prev_day['High'], dp, 'previous day')}")
+    if this_week is not None:
+        lines.append(f"  This week so far: high {f(this_week['High'])} | low {f(this_week['Low'])}")
+    if prev_week is not None:
+        lines.append(
+            f"  Previous week ({prev_week_label}): high {f(prev_week['High'])} | "
+            f"low {f(prev_week['Low'])} | close {f(prev_week['Close'])}"
+        )
+        lines.append(f"    Price is {where(price, prev_week['Low'], prev_week['High'], dp, 'previous week')}")
+    lines.append("  Last 5 daily closes (oldest to newest): " + ", ".join(f(x) for x in daily["Close"].tail(5)))
+    if not weekly.empty:
+        lines.append("  Last weekly closes (oldest to newest): " + ", ".join(f(x) for x in weekly["Close"]))
+    return "\n".join(lines)
+
+
 def fetch_markets():
     try:
         import yfinance as yf
@@ -205,24 +274,11 @@ def fetch_markets():
         for ticker in tickers:
             try:
                 t = yf.Ticker(ticker)
-                daily = t.history(period="1mo", interval="1d").dropna().tail(7)
+                daily = t.history(period="1mo", interval="1d").dropna().tail(10)
                 if daily.empty:
                     continue
                 weekly = t.history(period="3mo", interval="1wk").dropna().tail(4)
-                lines = [f"{name} [{ticker}]", "Daily candles (date O/H/L/C):"]
-                for idx, row in daily.iterrows():
-                    lines.append(
-                        f"  {idx:%Y-%m-%d} {row['Open']:.{dp}f}/{row['High']:.{dp}f}/"
-                        f"{row['Low']:.{dp}f}/{row['Close']:.{dp}f}"
-                    )
-                if not weekly.empty:
-                    lines.append("Weekly candles (week start O/H/L/C; last row may be incomplete):")
-                    for idx, row in weekly.iterrows():
-                        lines.append(
-                            f"  {idx:%Y-%m-%d} {row['Open']:.{dp}f}/{row['High']:.{dp}f}/"
-                            f"{row['Low']:.{dp}f}/{row['Close']:.{dp}f}"
-                        )
-                block = "\n".join(lines)
+                block = format_levels(name, ticker, daily, weekly, dp)
                 break
             except Exception as e:
                 print(f"Price fetch failed for {ticker}: {type(e).__name__}", file=sys.stderr)
@@ -248,6 +304,10 @@ def parse_feed(content, max_items, filtered, now_utc):
         if not title:
             continue
         summary = clean_text(entry.get("summary") or entry.get("description"), 220)
+        core = re.sub(r"\s+[-|]\s+[^-|]+$", "", title)  # headline without a trailing " - Publisher"
+        if summary and summary.lower().startswith(core.lower()):
+            rest = summary[len(core):].strip(" .:-")
+            summary = rest if len(rest) > 25 else ""  # keep only what the summary adds to the headline
         parsed = entry.get("published_parsed") or entry.get("updated_parsed")
         published = None
         if parsed:
@@ -364,6 +424,7 @@ def build_fulltext_section(official_items, problems):
 
 RULES = """RULES
 - Use ONLY the data below for dates, events, forecasts, statements, headlines and price levels. Never invent numbers.
+- KEY PRICE LEVELS were calculated by the script. Copy those numbers exactly, keep their labels (today so far, previous day, previous week) and never work out your own highs or lows.
 - If a data block says it is unavailable, say so plainly and do not fill the gap.
 - CENTRAL BANK FULL TEXT holds excerpts of official pages; some paragraphs are skipped. Base statements about what officials said on these excerpts only, and never assume what skipped parts said. Quote at most a short phrase (under 15 words).
 - Cite news by source name (for example FXStreet, ECB, BBC). Headlines are claims made by those sources, not verified facts; never add details beyond the headline and summary. If sources disagree, say so.
@@ -377,7 +438,7 @@ WEEKLY_TASK = """TASK: Write the WEEKLY brief for the week ahead. Maximum 600 wo
 2. CENTRAL BANKS - what officials actually said in the FULL TEXT excerpts: tone (hawkish, dovish or neutral), hints about the rate path, the data they emphasise, anything surprising. Name the institution and add the link for each item you rely on. If no full text was provided, say so.
 3. NEWS THEMES - 2 to 4 market themes from the headlines, naming the sources.
 4. SCENARIOS - for EUR/USD, GBP/USD, USD/JPY and Gold: one line each for the bullish case, the bearish case and what would invalidate each, tied to the events, central bank text, news and price data.
-5. PRICE CONTEXT - where each instrument sits versus last week's range and the recent daily range (only numbers from the data), plus highs/lows worth marking on weekly and daily charts. Use the Dollar Index for overall USD context.
+5. PRICE CONTEXT - for each instrument: the last price and where it sits versus the previous day and previous week levels under KEY PRICE LEVELS (copy the numbers exactly), naming the previous week and previous day highs/lows as levels worth marking on weekly and daily charts. Use the Dollar Index for overall USD context.
 6. NEWS RISK WINDOWS - times to be careful trading.
 7. ONE-LINE SUMMARY."""
 
@@ -385,7 +446,7 @@ DAILY_TASK = """TASK: Write the DAILY pre-London-open brief for today. Maximum 4
 1. TODAY'S EVENTS - with times and currencies, and why they matter for EUR/USD, GBP/USD, USD/JPY or gold (say so if there are none).
 2. CENTRAL BANKS AND OVERNIGHT NEWS - what officials said in the FULL TEXT excerpts (with the link for items you rely on) plus the 2 to 4 headlines that matter most, naming sources.
 3. SCENARIOS - one short line each for EUR/USD, GBP/USD, USD/JPY and Gold (bullish / bearish / invalidation).
-4. LEVELS TO WATCH - previous day and week highs/lows from the data.
+4. LEVELS TO WATCH - previous day and previous week highs/lows from KEY PRICE LEVELS (copy exactly).
 5. NEWS RISK WINDOWS.
 6. ONE-LINE SUMMARY."""
 
@@ -402,7 +463,7 @@ def build_prompt(now, calendar_text, fulltext_text, news_text, markets_text):
         f"impact: {', '.join(sorted(IMPACTS))}):\n{calendar_text}\n\n"
         f"CENTRAL BANK FULL TEXT (official pages, last {NEWS_HOURS} hours):\n{fulltext_text}\n\n"
         f"NEWS HEADLINES (last {NEWS_HOURS} hours, newest first within each source):\n{news_text}\n\n"
-        f"PRICE DATA (Yahoo Finance):\n{markets_text}\n"
+        f"KEY PRICE LEVELS (calculated by the script from Yahoo Finance data; copy exactly):\n{markets_text}\n"
     )
 
 
