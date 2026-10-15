@@ -110,19 +110,40 @@ POLICY_WORDS = re.compile(
 )
 
 
+def describe(exc):
+    """Short error text for logs and the Telegram footer, e.g. 'HTTPError 403'."""
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    return type(exc).__name__ + (f" {code}" if code else "")
+
+
+def http_get(url, timeout=30, tries=2):
+    """GET with one retry for timeouts, rate limits (429) and server errors (5xx)."""
+    for attempt in range(tries):
+        try:
+            r = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < tries - 1:
+                time.sleep(5)
+                continue
+            r.raise_for_status()
+            return r
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == tries - 1:
+                raise
+            time.sleep(5)
+
+
 # ----------------------------------------------------------------- calendar
 
 def fetch_calendar():
     events = []
     for url in CALENDAR_URLS:
         try:
-            r = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
-            r.raise_for_status()
+            r = http_get(url, timeout=30)
             data = r.json()
             if isinstance(data, list):
                 events.extend(data)
         except Exception as e:
-            print(f"Calendar fetch failed ({url.rsplit('/', 1)[-1]}): {type(e).__name__}", file=sys.stderr)
+            print(f"Calendar fetch failed ({url.rsplit('/', 1)[-1]}): {describe(e)}", file=sys.stderr)
     return events
 
 
@@ -246,12 +267,11 @@ def fetch_news(now):
     seen, lines, failed, official_items = set(), [], [], []
     for name, url, max_items, filtered, official in NEWS_SOURCES:
         try:
-            r = requests.get(url, timeout=25, headers={"User-Agent": USER_AGENT})
-            r.raise_for_status()
+            r = http_get(url, timeout=25)
             items = parse_feed(r.content, max_items, filtered, now_utc)
         except Exception as e:
-            print(f"News feed failed: {name}: {type(e).__name__}", file=sys.stderr)
-            failed.append(name)
+            print(f"News feed failed: {name}: {describe(e)}", file=sys.stderr)
+            failed.append(f"{name} ({describe(e)})")
             continue
         print(f"News: {name}: {len(items)} items")
         for published, title, summary, link in items:
@@ -308,8 +328,7 @@ def fetch_fulltext(candidates, limit):
         if link.lower().split("?")[0].endswith(".pdf"):
             continue  # PDFs are not read
         try:
-            r = requests.get(link, timeout=30, headers={"User-Agent": USER_AGENT})
-            r.raise_for_status()
+            r = http_get(link, timeout=30)
             ctype = r.headers.get("Content-Type", "").lower()
             if ctype and "html" not in ctype:
                 continue
@@ -318,7 +337,7 @@ def fetch_fulltext(candidates, limit):
                 continue
             docs.append((name, title, published, link, excerpt(text, FULLTEXT_CHARS)))
         except Exception as e:
-            print(f"Full text failed: {name}: {type(e).__name__}", file=sys.stderr)
+            print(f"Full text failed: {name}: {describe(e)}", file=sys.stderr)
     return docs
 
 
@@ -389,21 +408,57 @@ def build_prompt(now, calendar_text, fulltext_text, news_text, markets_text):
 
 # -------------------------------------------------------------------- Gemini
 
+API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
+
+# Google retires and renames models often, so the script asks the API which Flash models
+# exist (see candidate_models). This built-in list is only the fallback if that call fails.
+STATIC_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite",
+                 "gemini-flash-latest", "gemini-2.5-flash"]
+MAX_MODELS = 6
+
+
+def candidate_models(key):
+    """Model IDs to try in order: GEMINI_MODEL (if set), the 3 newest stable Flash models,
+    the newest Flash-Lite, then the built-in fallbacks."""
+    models = []
+    pinned = (os.getenv("GEMINI_MODEL") or "").strip()
+    if pinned:
+        models.append(pinned)
+    found = []
+    try:
+        r = requests.get(f"{API_ROOT}/models", params={"pageSize": 1000},
+                         headers={"x-goog-api-key": key}, timeout=30)
+        r.raise_for_status()
+        flash, lite = [], []
+        for m in r.json().get("models", []):
+            name = m.get("name", "").replace("models/", "")
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            # stable IDs only: skips preview / image / tts / live / audio variants
+            hit = re.fullmatch(r"gemini-(\d+(?:\.\d+)?)-flash(-lite)?", name)
+            if hit:
+                version = tuple(int(x) for x in hit.group(1).split("."))
+                (lite if hit.group(2) else flash).append((version, name))
+        found = [n for _, n in sorted(flash, reverse=True)[:3]] + [n for _, n in sorted(lite, reverse=True)[:1]]
+    except Exception as e:
+        print(f"Model list unavailable ({type(e).__name__}); using the built-in list.", file=sys.stderr)
+    for name in found + STATIC_MODELS:
+        if name not in models:
+            models.append(name)
+    return models[:MAX_MODELS]
+
+
 def call_gemini(prompt):
     key = os.environ["GEMINI_API_KEY"]
-    models = []
-    for m in (os.getenv("GEMINI_MODEL"), "gemini-2.5-flash", "gemini-flash-latest"):
-        if m and m not in models:
-            models.append(m)
-
-    last_err = "no model tried"
-    for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    errors = []
+    for model in candidate_models(key):
+        url = f"{API_ROOT}/models/{model}:generateContent"
         body = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 4096},
+            # the limit includes the model's internal "thinking" tokens, so it is generous
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192},
         }
-        r = None
+        status, r = 0, None
         for attempt in range(3):
             r = requests.post(
                 url,
@@ -411,16 +466,20 @@ def call_gemini(prompt):
                 json=body,
                 timeout=120,
             )
-            if r.status_code == 429 or r.status_code >= 500:
-                time.sleep(15 * (attempt + 1))
+            status = r.status_code
+            if status in (429, 500, 502, 503, 504) and attempt < 2:
+                wait = (10, 25)[attempt]
+                print(f"{model}: HTTP {status}, retrying in {wait}s", file=sys.stderr)
+                time.sleep(wait)
                 continue
             break
 
-        if r.status_code in (404, 429) or r.status_code >= 500:
-            last_err = f"{model}: HTTP {r.status_code}"
-            continue  # try the next model
-        if r.status_code != 200:
-            raise RuntimeError(f"Gemini error {r.status_code}: {r.text[:300]}")
+        if status in (403, 404, 429) or status >= 500:
+            errors.append(f"{model}: HTTP {status}")
+            print(f"{model}: HTTP {status}, trying the next model", file=sys.stderr)
+            continue
+        if status != 200:
+            raise RuntimeError(f"Gemini error {status} on {model}: {r.text[:300]}")
 
         try:
             parts = r.json()["candidates"][0]["content"]["parts"]
@@ -428,12 +487,24 @@ def call_gemini(prompt):
         except (KeyError, IndexError, ValueError):
             text = ""
         if text:
+            print(f"Gemini model used: {model}")
             return text
-        last_err = f"{model}: empty response"
+        errors.append(f"{model}: empty response")
 
     raise RuntimeError(
-        f"Gemini failed ({last_err}). If the model name is retired, set the GEMINI_MODEL "
-        "repository variable to a current model ID from AI Studio."
+        "Gemini failed - " + "; ".join(errors or ["no model tried"]) + ". "
+        "HTTP 503 means Google's servers are busy; run the workflow again later."
+    )
+
+
+def build_fallback(exc, calendar_text, news_text):
+    """What gets sent when the AI step fails: the raw data, so the run is not wasted."""
+    top_news = "\n".join(news_text.splitlines()[:30])
+    return (
+        f"AI SUMMARY UNAVAILABLE ({str(exc)[:300]})\n"
+        "Raw data instead:\n\n"
+        f"ECONOMIC CALENDAR\n{calendar_text}\n\n"
+        f"TOP HEADLINES\n{top_news}"
     )
 
 
@@ -490,7 +561,12 @@ def main():
 
     prompt = build_prompt(now, calendar_text, fulltext_text, news_text, markets_text)
     print(f"Prompt size: {len(prompt)} characters.")
-    analysis = call_gemini(prompt)
+    try:
+        analysis = call_gemini(prompt)
+    except Exception as exc:
+        print(f"Gemini failed: {exc}", file=sys.stderr)
+        problems.append("Gemini AI summary")
+        analysis = build_fallback(exc, calendar_text, news_text)
 
     title = "WEEKLY BRIEF" if MODE == "weekly" else "DAILY BRIEF"
     footer = "AI-generated scenarios for context, not trade signals."
