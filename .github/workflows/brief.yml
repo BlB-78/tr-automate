@@ -2,8 +2,10 @@ name: Trading brief
 
 on:
   schedule:
-    - cron: "0 17 * * 0"    # Sunday 17:00 UTC = 18:00 Algeria -> weekly brief
-    - cron: "30 6 * * 1-5"  # Mon-Fri 06:30 UTC = 07:30 Algeria -> daily brief
+    # GitHub starts scheduled runs late when it is busy (worst at the top of the hour),
+    # so these use odd minutes and start a little early. Times are UTC; Algeria is UTC+1.
+    - cron: "43 16 * * 0"   # Sunday 16:43 UTC = 17:43 Algeria -> weekly brief
+    - cron: "47 5 * * 1-5"  # Mon-Fri 05:47 UTC = 06:47 Algeria -> daily brief
   workflow_dispatch:
     inputs:
       mode:
@@ -13,6 +15,14 @@ on:
         options:
           - weekly
           - daily
+      language:
+        description: "Language (default = the BRIEF_LANGUAGE repository variable, or English)"
+        type: choice
+        default: default
+        options:
+          - default
+          - en
+          - ar
 
 permissions:
   contents: read
@@ -20,7 +30,7 @@ permissions:
 jobs:
   brief:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -29,12 +39,14 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install requests yfinance feedparser trafilatura
+        run: pip install requests yfinance feedparser trafilatura pypdf
 
       - name: Send brief
         run: python brief.py
         env:
-          MODE: ${{ inputs.mode || (github.event.schedule == '0 17 * * 0' && 'weekly' || 'daily') }}
+          CRON: ${{ github.event.schedule }}
+          MODE: ${{ inputs.mode || (github.event.schedule == '43 16 * * 0' && 'weekly' || 'daily') }}
+          BRIEF_LANGUAGE: ${{ (inputs.language != 'default' && inputs.language) || vars.BRIEF_LANGUAGE || 'en' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
