@@ -1,25 +1,27 @@
 """
-Trading brief automation (v3).
+Trading brief automation (v4).
 
-Collects four kinds of data, asks Gemini for a brief, sends it to Telegram:
-  1. Economic calendar   - Forex Factory public feed (USD, EUR, GBP, JPY)
-  2. Prices              - Yahoo Finance via yfinance (EUR/USD, GBP/USD, USD/JPY, Gold, DXY)
-  3. Central bank text   - full-text excerpts of the latest Fed / ECB / BoE / BoJ statements and speeches
+Collects four kinds of data, asks Gemini for a brief, sends it to Telegram (English or Arabic):
+  1. Economic calendar   - Forex Factory public feed (USD, EUR, GBP, JPY, CHF, AUD, CAD, NZD)
+  2. Prices              - Yahoo Finance via yfinance (7 pairs, Gold, DXY); the key levels are calculated here
+  3. Central bank text   - full text (web pages and PDFs) of the latest Fed / ECB / BoE / BoJ / RBA / BoC /
+                           SNB / RBNZ statements and speeches
   4. News headlines      - RSS feeds: central banks + forex/economy sites
 
-MODE=weekly -> week-ahead brief      MODE=daily -> pre-London brief
+MODE=weekly -> week-ahead brief      MODE=daily -> pre-London brief      BRIEF_LANGUAGE=en or ar
 
 Secrets (environment variables): GEMINI_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-Optional settings: GEMINI_MODEL, TZ_NAME, CURRENCIES, IMPACTS, FULLTEXT_CHARS
+Optional settings: GEMINI_MODEL, TZ_NAME, CURRENCIES, IMPACTS, FULLTEXT_CHARS, BRIEF_LANGUAGE
 """
 import html
+import io
 import os
 import re
 import sys
 import time
 from calendar import timegm
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -30,16 +32,61 @@ try:
 except ImportError:  # the brief still works without it, minus the central bank full text
     trafilatura = None
 
+try:
+    from pypdf import PdfReader
+except ImportError:  # PDFs are then skipped
+    PdfReader = None
+
 MODE = (os.getenv("MODE") or "weekly").strip().lower()
 if MODE not in ("weekly", "daily"):
     MODE = "weekly"
 
 TZ = ZoneInfo(os.getenv("TZ_NAME") or "Africa/Algiers")
-CURRENCIES = {c.strip().upper() for c in (os.getenv("CURRENCIES") or "USD,EUR,GBP,JPY").split(",") if c.strip()}
+CURRENCIES = {c.strip().upper() for c in (os.getenv("CURRENCIES") or "USD,EUR,GBP,JPY,CHF,AUD,CAD,NZD").split(",") if c.strip()}
 IMPACTS = {i.strip().title() for i in (os.getenv("IMPACTS") or "High,Medium,Holiday").split(",") if i.strip()}
 
 USER_AGENT = "Mozilla/5.0 (compatible; personal-trading-brief/3.0)"
 OLDEST = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+# ------------------------------------------------------------ language option
+# BRIEF_LANGUAGE=ar makes Gemini write the brief in Arabic; these are the fixed phrases the script adds itself.
+BRIEF_LANGUAGE = (os.getenv("BRIEF_LANGUAGE") or "en").strip().lower()
+if BRIEF_LANGUAGE not in ("en", "ar"):
+    BRIEF_LANGUAGE = "en"
+
+_TEXT = {
+    "en": {
+        "weekly": "WEEKLY BRIEF",
+        "daily": "DAILY BRIEF",
+        "disclaimer": "AI-generated scenarios for context, not trade signals.",
+        "failed": "Sources that failed this run: ",
+        "crashed": "Trading brief failed: ",
+        "fallback": "AI SUMMARY UNAVAILABLE",
+        "raw": "Raw data instead:",
+        "levels": "KEY PRICE LEVELS",
+        "calendar": "ECONOMIC CALENDAR",
+        "headlines": "TOP HEADLINES",
+        "scheduled": "scheduled run",
+        "manual": "manual run",
+        "late": "Note: GitHub started this scheduled run {minutes} minutes late.",
+    },
+    "ar": {
+        "weekly": "الملخص الأسبوعي",
+        "daily": "الملخص اليومي",
+        "disclaimer": "سيناريوهات مولّدة بالذكاء الاصطناعي للاطلاع فقط، وليست إشارات تداول.",
+        "failed": "المصادر التي تعذّر جلبها في هذه المرة: ",
+        "crashed": "تعذّر إنشاء الملخص: ",
+        "fallback": "ملخص الذكاء الاصطناعي غير متاح",
+        "raw": "البيانات الخام بدلاً منه:",
+        "levels": "مستويات الأسعار الرئيسية",
+        "calendar": "التقويم الاقتصادي",
+        "headlines": "أبرز العناوين",
+        "scheduled": "تشغيل مجدول",
+        "manual": "تشغيل يدوي",
+        "late": "ملاحظة: تأخّر GitHub في بدء هذا التشغيل المجدول {minutes} دقيقة.",
+    },
+}
+TEXT = _TEXT[BRIEF_LANGUAGE]
 
 # ------------------------------------------------------------------ sources
 
@@ -53,9 +100,14 @@ MARKETS = {
     "EUR/USD": (["EURUSD=X"], 5),
     "GBP/USD": (["GBPUSD=X"], 5),
     "USD/JPY": (["JPY=X", "USDJPY=X"], 3),
+    "USD/CHF": (["CHF=X", "USDCHF=X"], 5),
+    "AUD/USD": (["AUDUSD=X"], 5),
+    "USD/CAD": (["CAD=X", "USDCAD=X"], 5),
+    "NZD/USD": (["NZDUSD=X"], 5),
     "Gold XAU/USD (futures used as proxy)": (["GC=F", "XAUUSD=X"], 2),
     "US Dollar Index (DXY)": (["DX-Y.NYB"], 3),
 }
+PAIR_LIST = "EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, USD/CAD, NZD/USD and Gold (XAU/USD)"
 
 def gnews(query):
     """Google News RSS search: headlines (with the publisher's name) for a query, newest first."""
@@ -77,11 +129,19 @@ NEWS_SOURCES = [
     ("Bank of England - news", "https://www.bankofengland.co.uk/rss/news", 6, False, True),
     ("Bank of England - speeches", "https://www.bankofengland.co.uk/rss/speeches", 4, False, True),
     ("Bank of Japan - what's new", "https://www.boj.or.jp/en/rss/whatsnew.xml", 6, False, True),
+    ("Reserve Bank of Australia - media releases", "https://www.rba.gov.au/rss/rss-cb-media-releases.xml", 4, False, True),
+    ("Reserve Bank of Australia - speeches", "https://www.rba.gov.au/rss/rss-cb-speeches.xml", 4, False, True),
+    ("Bank of Canada - press releases", "https://www.bankofcanada.ca/content_type/press-releases/feed/", 4, False, True),
+    ("Bank of Canada - speeches", "https://www.bankofcanada.ca/content_type/speeches/feed/", 4, False, True),
+    ("Swiss National Bank - press releases", "https://www.snb.ch/public/rss/en/pressrel", 4, False, True),
+    ("Swiss National Bank - speeches", "https://www.snb.ch/public/rss/en/speeches", 4, False, True),
+    ("Reserve Bank of New Zealand - news", "https://www.rbnz.govt.nz/feeds/news", 5, False, True),
     # forex-focused news and analysis (FXStreet was removed: it answers 403 to GitHub's servers)
     ("Action Forex", "https://www.actionforex.com/feed/", 12, False, False),
     ("MarketPulse (OANDA)", "https://www.marketpulse.com/feed/", 10, False, False),
     ("Google News - forex", gnews('forex OR "EUR/USD" OR "GBP/USD" OR "USD/JPY"'), 12, False, False),
     ("Google News - gold, Fed, yields", gnews('"gold price" OR "Federal Reserve" OR "Treasury yields"'), 12, False, False),
+    ("Google News - AUD, NZD, CAD, CHF", gnews('"Australian dollar" OR "New Zealand dollar" OR "Canadian dollar" OR "Swiss franc"'), 10, False, False),
     # general economy / markets news
     ("CNBC - economy", "https://www.cnbc.com/id/20910258/device/rss/rss.html", 8, True, False),
     ("BBC - business", "https://feeds.bbci.co.uk/news/business/rss.xml", 8, True, False),
@@ -90,8 +150,8 @@ NEWS_SOURCES = [
 ]
 
 NEWS_HOURS = 168 if MODE == "weekly" else 36
-MAX_NEWS_LINES = 120
-MAX_FULLTEXT = 5 if MODE == "weekly" else 4          # central bank pages to read per run
+MAX_NEWS_LINES = 150
+MAX_FULLTEXT = 6 if MODE == "weekly" else 5          # central bank pages to read per run
 FULLTEXT_CHARS = int(os.getenv("FULLTEXT_CHARS") or 6000)  # excerpt size per page
 
 KEYWORDS = re.compile(
@@ -99,7 +159,8 @@ KEYWORDS = re.compile(
     r"interest rates?|rate (?:cut|cuts|hike|hikes|decision)|central bank|fed|fomc|powell|"
     r"ecb|lagarde|boe|bank of england|bailey|boj|bank of japan|ueda|yen|euro|sterling|pound|"
     r"dollar|treasury|yields?|bonds?|gold|oil|tariffs?|recession|economy|economic|trade|"
-    r"currency|forex|stimulus|budget|deficit|debt)\b",
+    r"currency|forex|stimulus|budget|deficit|debt|aussie|loonie|kiwi|franc|rba|rbnz|snb|boc|"
+    r"bank of canada|reserve bank|swiss national bank)\b",
     re.I,
 )
 
@@ -107,11 +168,12 @@ KEYWORDS = re.compile(
 OFFICIAL_NOISE = re.compile(
     r"\b(accounts?|money stock|bonds? held|CV and questionnaire|simulation|banknotes?|"
     r"payment systems?|supervis\w*|discount rate|market operations|tripartite|"
-    r"money markets? committee|consultation)\b",
+    r"money markets? committee|consultation|penalt\w*|enforcement|AML|CFT|licen[cs]\w*|prudential|insur\w*)\b",
     re.I,
 )
-OTHER_PAIRS = re.compile(r"\b(?:AUD|NZD|CAD|CHF|CNH|SEK|NOK)\b|\b(?:GBP/JPY|EUR/JPY|EUR/GBP)\b", re.I)
-SKIP_BY_SOURCE = {"Action Forex": OTHER_PAIRS}
+# Cross pairs (neither side is USD, e.g. GBP/JPY or AUD/NZD) are not on the watch list.
+CROSS_PAIRS = re.compile(r"\b(?!USD)[A-Z]{3}/(?!USD)[A-Z]{3}\b")
+SKIP_BY_SOURCE = {"Action Forex": CROSS_PAIRS}
 
 # Which central bank items are worth reading in full (matched against the title).
 OFFICIAL_FOCUS = re.compile(
@@ -195,7 +257,7 @@ def select_events(raw, now):
     return chosen
 
 
-def format_events(chosen, cap=80):
+def format_events(chosen, cap=100):
     if not chosen:
         return "No matching events in this window for the selected currencies and impact levels."
     high = [c for c in chosen if c[2] == "High"]
@@ -293,6 +355,7 @@ def fetch_markets():
             except Exception as e:
                 print(f"Price fetch failed for {ticker}: {type(e).__name__}", file=sys.stderr)
         blocks.append(block or f"{name}: price data unavailable.")
+        time.sleep(0.5)  # be gentle with Yahoo
     return "\n\n".join(blocks)
 
 
@@ -366,16 +429,31 @@ def fetch_news(now):
 # ------------------------------------------------- central bank full text
 
 def excerpt(text, budget):
-    """Shrink a long page to `budget` characters, keeping the opening and the policy-heavy paragraphs."""
+    """Shrink a long page to `budget` characters: the opening (for context), then the paragraphs
+    richest in policy words, kept in their original order."""
     paras = [p.strip() for p in text.split("\n") if len(p.strip()) > 40]
     if sum(len(p) + 1 for p in paras) <= budget:
         return "\n".join(paras)
-    out, used = [], 0
-    for p in paras:
-        if (used < 800 or POLICY_WORDS.search(p)) and used + len(p) + 1 <= budget:
-            out.append(p)
+
+    def score(p):  # how many different policy words the paragraph uses
+        return len({w.lower() for w in POLICY_WORDS.findall(p)})
+
+    chosen, used = set(), 0
+    for i, p in enumerate(paras):  # the opening, about 600 characters
+        if used >= 600:
+            break
+        if used + len(p) + 1 <= budget:
+            chosen.add(i)
             used += len(p) + 1
-    return "\n".join(out) if out else " ".join(paras)[:budget]
+    for i in sorted((i for i in range(len(paras)) if i not in chosen), key=lambda i: (-score(paras[i]), i)):
+        if score(paras[i]) == 0:
+            break
+        if used + len(paras[i]) + 1 <= budget:
+            chosen.add(i)
+            used += len(paras[i]) + 1
+    if not chosen:
+        return " ".join(paras)[:budget]
+    return "\n".join(paras[i] for i in sorted(chosen))
 
 
 def pick_fulltext_candidates(items):
@@ -391,19 +469,63 @@ def pick_fulltext_candidates(items):
     return picked
 
 
+def pdf_to_text(content, max_pages=12):
+    """Text of a PDF, regrouped into paragraphs of about four sentences (PDF line breaks are not real paragraphs)."""
+    if PdfReader is None:
+        raise RuntimeError("pypdf not installed")
+    reader = PdfReader(io.BytesIO(content))
+    text = "\n".join((page.extract_text() or "") for page in reader.pages[:max_pages])
+    text = re.sub(r"-\n(?=[a-z])", "", text)   # re-join words split at the end of a line
+    text = re.sub(r"\s*\n\s*", " ", text)      # line breaks become spaces
+    sentences = re.split(r"""(?<=[.!?])\s+(?=[A-Z"'])""", text)
+    return "\n".join(" ".join(sentences[i:i + 4]) for i in range(0, len(sentences), 4))
+
+
+def find_pdf_link(page_html, page_url, strict):
+    """The PDF a short page links to. Bank of Japan speech pages only hold a link to the real text as a PDF.
+    strict=True accepts only a PDF whose file name contains the page's own name (ko261015a.htm -> ko261015a.pdf)."""
+    urls = []
+    for href in re.findall(r"""href=["']([^"'#?]+\.pdf)(?:[?#][^"']*)?["']""", page_html, re.I):
+        full = urljoin(page_url, href)
+        if full not in urls:
+            urls.append(full)
+    stem = re.search(r"/([^/]+?)\.html?(?:$|[?#])", page_url)
+    if stem:
+        for u in urls:
+            if stem.group(1) in u:
+                return u
+    if not strict and len(urls) == 1:
+        return urls[0]
+    return None
+
+
+def fetch_page_text(link):
+    """Readable text of a web page or PDF; '' if nothing useful could be read."""
+    r = http_get(link, timeout=45)
+    ctype = r.headers.get("Content-Type", "").lower()
+    if "pdf" in ctype or link.lower().split("?")[0].endswith(".pdf"):
+        return pdf_to_text(r.content)
+    text = ""
+    if not ctype or "html" in ctype:
+        text = trafilatura.extract(r.text, include_comments=False, include_tables=False) or ""
+    pdf_url = find_pdf_link(r.text, link, strict=len(text) >= 1500)
+    if pdf_url:  # the page is short, or it has a PDF with its own name: that is the real text
+        try:
+            alt = pdf_to_text(http_get(pdf_url, timeout=45).content)
+            if len(alt) > len(text):
+                return alt
+        except Exception as e:
+            print(f"Linked PDF failed ({pdf_url.rsplit('/', 1)[-1]}): {describe(e)}", file=sys.stderr)
+    return text
+
+
 def fetch_fulltext(candidates, limit):
     docs = []
     for published, name, title, link in candidates:
         if len(docs) >= limit:
             break
-        if link.lower().split("?")[0].endswith(".pdf"):
-            continue  # PDFs are not read
         try:
-            r = http_get(link, timeout=30)
-            ctype = r.headers.get("Content-Type", "").lower()
-            if ctype and "html" not in ctype:
-                continue
-            text = trafilatura.extract(r.text, include_comments=False, include_tables=False) or ""
+            text = fetch_page_text(link)
             if len(text) < 300:  # extraction failed or the page is just a stub
                 continue
             docs.append((name, title, published, link, excerpt(text, FULLTEXT_CHARS)))
@@ -433,42 +555,55 @@ def build_fulltext_section(official_items, problems):
 
 # -------------------------------------------------------------------- prompt
 
+TRADER = (
+    "You are a market analyst writing a briefing for a retail forex and gold trader. "
+    f"The watch list is {PAIR_LIST}, with the Dollar Index (DXY) for USD context. "
+    "Use general trading concepts: macro drivers and central bank policy, data surprises against "
+    "forecast, risk sentiment, yields, currency correlations, and support and resistance taken "
+    "from the previous day and previous week highs and lows listed under KEY PRICE LEVELS."
+)
+
 RULES = """RULES
 - Use ONLY the data below for dates, events, forecasts, statements, headlines and price levels. Never invent numbers.
-- KEY PRICE LEVELS were calculated by the script. Copy those numbers exactly, keep their labels (today so far, previous day, previous week) and never work out your own highs or lows.
+- KEY PRICE LEVELS were calculated by the script. Copy those numbers exactly, keep their labels (today so far, previous day, previous week) and never work out your own highs or lows. Do not invent any other chart levels.
 - If a data block says it is unavailable, say so plainly and do not fill the gap.
 - CENTRAL BANK FULL TEXT holds excerpts of official pages; some paragraphs are skipped. Base statements about what officials said on these excerpts only, and never assume what skipped parts said. Quote at most a short phrase (under 15 words).
-- Cite news by source name (for example FXStreet, ECB, BBC). Headlines are claims made by those sources, not verified facts; never add details beyond the headline and summary. If sources disagree, say so.
+- Cite news by source name (for example Reuters, ECB, BBC). Headlines are claims made by those sources, not verified facts; never add details beyond the headline and summary. If sources disagree, say so.
 - Anything that is not from the data must be labelled "general context".
 - Give scenarios, not predictions or trade signals. Never tell the reader to buy or sell.
-- Do not draw or invent supply/demand zones; the trader does that. You may point to previous weekly/daily highs and lows from the data as levels worth marking.
-- Output is plain text for Telegram: no markdown symbols (no asterisks, hashes or backticks). Use CAPS headings and "-" bullets."""
+- Output is plain text for Telegram: no markdown symbols (no asterisks, hashes or backticks). Put each section heading on its own line and use "-" bullets."""
 
-WEEKLY_TASK = """TASK: Write the WEEKLY brief for the week ahead. Maximum 600 words. Sections:
-1. WEEK AHEAD - the 5 to 7 events that matter most (day, time, currency) and why they matter for EUR/USD, GBP/USD, USD/JPY or gold.
-2. CENTRAL BANKS - what officials actually said in the FULL TEXT excerpts: tone (hawkish, dovish or neutral), hints about the rate path, the data they emphasise, anything surprising. Name the institution and add the link for each item you rely on. If no full text was provided, say so.
+LANGUAGE_RULE_AR = """
+- LANGUAGE: write the whole brief in clear Modern Standard Arabic, including the section headings. Keep currency pair names (such as EUR/USD), numbers, clock times, links and source names in Latin characters and digits 0-9. Write day and month names in Arabic. Give each central bank's name in Arabic with its abbreviation in brackets the first time, for example البنك المركزي الأوروبي (ECB)."""
+
+INSTRUMENT_FORMAT = """one block per instrument (EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, USD/CAD, NZD/USD, Gold), then one line for the Dollar Index. Use exactly this format for each block:
+NAME - last price; where it sits versus the previous day and previous week (copy from KEY PRICE LEVELS)
+- Bullish: the driver (from the events, central bank text or news); invalidated below LEVEL
+- Bearish: the driver; invalidated above LEVEL
+- Levels: previous day high / low, previous week high / low
+LEVEL must be copied from KEY PRICE LEVELS: use a previous day or previous week low for the bullish case and a previous day or previous week high for the bearish case."""
+
+WEEKLY_TASK = """TASK: Write the WEEKLY brief for the week ahead. Maximum 950 words. Sections:
+1. WEEK AHEAD - the 6 to 8 events that matter most. One line each: day, time, currency, event name, then "forecast X vs previous Y" when the calendar gives them, then why it matters for the watch list (what a result above or below forecast would mean for that currency).
+2. CENTRAL BANKS - what officials actually said in the FULL TEXT excerpts: tone (hawkish, dovish or neutral), hints about the rate path, the data they emphasise, anything surprising. Name the institution and add the link for each item you rely on. If no full text was provided for a central bank, say so.
 3. NEWS THEMES - 2 to 4 market themes from the headlines, naming the sources.
-4. SCENARIOS - for EUR/USD, GBP/USD, USD/JPY and Gold: one line each for the bullish case, the bearish case and what would invalidate each, tied to the events, central bank text, news and price data.
-5. PRICE CONTEXT - for each instrument: the last price and where it sits versus the previous day and previous week levels under KEY PRICE LEVELS (copy the numbers exactly), naming the previous week and previous day highs/lows as levels worth marking on weekly and daily charts. Use the Dollar Index for overall USD context.
-6. NEWS RISK WINDOWS - times to be careful trading.
-7. ONE-LINE SUMMARY."""
-
-DAILY_TASK = """TASK: Write the DAILY pre-London-open brief for today. Maximum 400 words. Sections:
-1. TODAY'S EVENTS - with times and currencies, and why they matter for EUR/USD, GBP/USD, USD/JPY or gold (say so if there are none).
-2. CENTRAL BANKS AND OVERNIGHT NEWS - what officials said in the FULL TEXT excerpts (with the link for items you rely on) plus the 2 to 4 headlines that matter most, naming sources.
-3. SCENARIOS - one short line each for EUR/USD, GBP/USD, USD/JPY and Gold (bullish / bearish / invalidation).
-4. LEVELS TO WATCH - previous day and previous week highs/lows from KEY PRICE LEVELS (copy exactly).
-5. NEWS RISK WINDOWS.
+4. INSTRUMENTS - """ + INSTRUMENT_FORMAT + """
+5. NEWS RISK WINDOWS - times to be careful trading, with the event names.
 6. ONE-LINE SUMMARY."""
+
+DAILY_TASK = """TASK: Write the DAILY pre-London-open brief for today. Maximum 650 words. Sections:
+1. TODAY'S EVENTS - one line each: time, currency, event name, then "forecast X vs previous Y" when the calendar gives them, then why it matters for the watch list (say so if there are none).
+2. CENTRAL BANKS AND OVERNIGHT NEWS - what officials said in the FULL TEXT excerpts (with the link for items you rely on) plus the 2 to 4 headlines that matter most, naming sources.
+3. INSTRUMENTS - """ + INSTRUMENT_FORMAT + """ Keep each driver to one short phrase.
+4. NEWS RISK WINDOWS.
+5. ONE-LINE SUMMARY."""
 
 
 def build_prompt(now, calendar_text, fulltext_text, news_text, markets_text):
     task = WEEKLY_TASK if MODE == "weekly" else DAILY_TASK
+    rules = RULES + (LANGUAGE_RULE_AR if BRIEF_LANGUAGE == "ar" else "")
     return (
-        "You are a market analyst assisting a Supply & Demand forex trader who focuses on "
-        "EUR/USD, GBP/USD, USD/JPY and Gold (XAU/USD), uses the Dollar Index (DXY) for USD context, "
-        "and works a weekly > daily > 4H > 1H top-down process.\n\n"
-        f"{task}\n\n{RULES}\n\n"
+        f"{TRADER}\n\n{task}\n\n{rules}\n\n"
         f"CURRENT TIME: {now:%A %d %B %Y, %H:%M} ({TZ.key}). All times below use this timezone.\n\n"
         f"ECONOMIC CALENDAR (currencies: {', '.join(sorted(CURRENCIES))}; "
         f"impact: {', '.join(sorted(IMPACTS))}):\n{calendar_text}\n\n"
@@ -520,7 +655,7 @@ def candidate_models(key):
     return models[:MAX_MODELS]
 
 
-GEMINI_DEADLINE_S = 330  # total time budget for the AI step, so a slow day cannot hit the 10-minute workflow limit
+GEMINI_DEADLINE_S = 420  # total time budget for the AI step, so a slow day cannot hit the workflow's 15-minute limit
 
 
 def call_gemini(prompt):
@@ -544,7 +679,7 @@ def call_gemini(prompt):
                     url,
                     headers={"x-goog-api-key": key, "Content-Type": "application/json"},
                     json=body,
-                    timeout=(15, 100),  # 15 s to connect, 100 s to wait for the answer
+                    timeout=(15, 120),  # 15 s to connect, 120 s to wait for the answer
                 )
             except (requests.Timeout, requests.ConnectionError) as e:
                 print(f"{model}: {describe(e)}, trying the next model", file=sys.stderr)
@@ -594,11 +729,11 @@ def build_fallback(exc, calendar_text, news_text, markets_text):
             per_source[name] = per_source.get(name, 0) + 1
             picked.append(line)
     return (
-        f"AI SUMMARY UNAVAILABLE ({str(exc)[:300]})\n"
-        "Raw data instead:\n\n"
-        f"KEY PRICE LEVELS\n{markets_text}\n\n"
-        f"ECONOMIC CALENDAR\n{calendar_text}\n\n"
-        f"TOP HEADLINES\n" + "\n".join(picked[:30])
+        f"{TEXT['fallback']} ({str(exc)[:300]})\n"
+        f"{TEXT['raw']}\n\n"
+        f"{TEXT['levels']}\n{markets_text}\n\n"
+        f"{TEXT['calendar']}\n{calendar_text}\n\n"
+        f"{TEXT['headlines']}\n" + "\n".join(picked[:30])
     )
 
 
@@ -627,6 +762,27 @@ def send_telegram(text):
             )
             if r.status_code != 200:
                 raise RuntimeError(f"Telegram error {r.status_code}: {r.text[:200]}")
+
+
+# ------------------------------------------------------------- run timing
+
+def run_label():
+    """'scheduled run' or 'manual run', so the message itself shows how it was started."""
+    event = os.getenv("GITHUB_EVENT_NAME")
+    return {"schedule": TEXT["scheduled"], "workflow_dispatch": TEXT["manual"]}.get(event, "")
+
+
+def lateness_note(now):
+    """For scheduled runs: how late GitHub started the run (the cron time comes from the workflow file)."""
+    if os.getenv("GITHUB_EVENT_NAME") != "schedule":
+        return ""
+    cron = (os.getenv("CRON") or "").split()
+    if len(cron) < 2 or not (cron[0].isdigit() and cron[1].isdigit()):
+        return ""
+    now_utc = now.astimezone(timezone.utc)
+    planned = now_utc.replace(hour=int(cron[1]), minute=int(cron[0]), second=0, microsecond=0)
+    late_minutes = int((now_utc - planned).total_seconds() // 60)
+    return TEXT["late"].format(minutes=late_minutes) if late_minutes > 45 else ""
 
 
 # ---------------------------------------------------------------------- main
@@ -662,11 +818,17 @@ def main():
         problems.append("Gemini AI summary")
         analysis = build_fallback(exc, calendar_text, news_text, markets_text)
 
-    title = "WEEKLY BRIEF" if MODE == "weekly" else "DAILY BRIEF"
-    footer = "AI-generated scenarios for context, not trade signals."
+    title = TEXT[MODE]
+    date_label = f"{now:%Y-%m-%d}" if BRIEF_LANGUAGE == "ar" else f"{now:%a %d %b %Y}"
+    label = run_label()
+    header = f"{title} - {date_label} {now:%H:%M}" + (f" ({label})" if label else "")
+    late = lateness_note(now)
+    if late:
+        header += "\n" + late
+    footer = TEXT["disclaimer"]
     if problems:
-        footer += "\nSources that failed this run: " + ", ".join(problems)
-    send_telegram(f"{title} - {now:%a %d %b %Y}\n\n{analysis}\n\n{footer}")
+        footer += "\n" + TEXT["failed"] + ", ".join(problems)
+    send_telegram(f"{header}\n\n{analysis}\n\n{footer}")
     print("Sent.")
 
 
@@ -676,7 +838,7 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         try:
-            send_telegram(f"Trading brief failed: {str(exc)[:300]}")
+            send_telegram(f"{TEXT['crashed']}{str(exc)[:300]}")
         except Exception:
             pass
         sys.exit(1)
