@@ -168,7 +168,8 @@ KEYWORDS = re.compile(
 OFFICIAL_NOISE = re.compile(
     r"\b(accounts?|money stock|bonds? held|CV and questionnaire|simulation|banknotes?|"
     r"payment systems?|supervis\w*|discount rate|market operations|tripartite|"
-    r"money markets? committee|consultation|penalt\w*|enforcement|AML|CFT|licen[cs]\w*|prudential|insur\w*)\b",
+    r"money markets? committee|consultation|penalt\w*|enforcement|AML|CFT|licen[cs]\w*|prudential|insur\w*|"
+    r"SONIA|advisory group|working group|chief risk|risk officer|stress tests?)\b",
     re.I,
 )
 # Cross pairs (neither side is USD, e.g. GBP/JPY or AUD/NZD) are not on the watch list.
@@ -217,16 +218,19 @@ def http_get(url, timeout=30, tries=2):
 # ----------------------------------------------------------------- calendar
 
 def fetch_calendar():
-    events = []
+    """Returns (events, failures); a failure reads like 'calendar ff_calendar_nextweek.json (HTTPError 404)'."""
+    events, failures = [], []
     for url in CALENDAR_URLS:
+        name = url.rsplit("/", 1)[-1]
         try:
             r = http_get(url, timeout=30)
             data = r.json()
             if isinstance(data, list):
                 events.extend(data)
         except Exception as e:
-            print(f"Calendar fetch failed ({url.rsplit('/', 1)[-1]}): {describe(e)}", file=sys.stderr)
-    return events
+            print(f"Calendar fetch failed ({name}): {describe(e)}", file=sys.stderr)
+            failures.append(f"calendar {name} ({describe(e)})")
+    return events, failures
 
 
 def to_local(date_str):
@@ -334,6 +338,12 @@ def format_levels(name, ticker, daily, weekly, dp, today=None):
     return "\n".join(lines)
 
 
+def clean_candles(df):
+    """Drop incomplete rows and flat placeholder candles (high equal to low) that Yahoo sometimes adds."""
+    df = df.dropna()
+    return df[df["High"] > df["Low"]]
+
+
 def fetch_markets():
     try:
         import yfinance as yf
@@ -346,10 +356,10 @@ def fetch_markets():
         for ticker in tickers:
             try:
                 t = yf.Ticker(ticker)
-                daily = t.history(period="1mo", interval="1d").dropna().tail(10)
+                daily = clean_candles(t.history(period="1mo", interval="1d")).tail(10)
                 if daily.empty:
                     continue
-                weekly = t.history(period="3mo", interval="1wk").dropna().tail(4)
+                weekly = clean_candles(t.history(period="3mo", interval="1wk")).tail(4)
                 block = format_levels(name, ticker, daily, weekly, dp)
                 break
             except Exception as e:
@@ -567,6 +577,7 @@ RULES = """RULES
 - Use ONLY the data below for dates, events, forecasts, statements, headlines and price levels. Never invent numbers.
 - KEY PRICE LEVELS were calculated by the script. Copy those numbers exactly, keep their labels (today so far, previous day, previous week) and never work out your own highs or lows. Do not invent any other chart levels.
 - If a data block says it is unavailable, say so plainly and do not fill the gap.
+- If the ECONOMIC CALENDAR block says it is incomplete or unavailable, tell the reader the calendar could not be checked; never say that no events are scheduled.
 - CENTRAL BANK FULL TEXT holds excerpts of official pages; some paragraphs are skipped. Base statements about what officials said on these excerpts only, and never assume what skipped parts said. Quote at most a short phrase (under 15 words).
 - Cite news by source name (for example Reuters, ECB, BBC). Headlines are claims made by those sources, not verified facts; never add details beyond the headline and summary. If sources disagree, say so.
 - Anything that is not from the data must be labelled "general context".
@@ -585,7 +596,7 @@ LEVEL must be copied from KEY PRICE LEVELS: use a previous day or previous week 
 
 WEEKLY_TASK = """TASK: Write the WEEKLY brief for the week ahead. Maximum 950 words. Sections:
 1. WEEK AHEAD - the 6 to 8 events that matter most. One line each: day, time, currency, event name, then "forecast X vs previous Y" when the calendar gives them, then why it matters for the watch list (what a result above or below forecast would mean for that currency).
-2. CENTRAL BANKS - what officials actually said in the FULL TEXT excerpts: tone (hawkish, dovish or neutral), hints about the rate path, the data they emphasise, anything surprising. Name the institution and add the link for each item you rely on. If no full text was provided for a central bank, say so.
+2. CENTRAL BANKS - what officials actually said in the FULL TEXT excerpts: tone (hawkish, dovish or neutral), hints about the rate path, the data they emphasise, anything surprising. Name the institution and add the link for each item you rely on. Central banks with no relevant text: do not give each its own line, list them together in one short line.
 3. NEWS THEMES - 2 to 4 market themes from the headlines, naming the sources.
 4. INSTRUMENTS - """ + INSTRUMENT_FORMAT + """
 5. NEWS RISK WINDOWS - times to be careful trading, with the event names.
@@ -593,7 +604,7 @@ WEEKLY_TASK = """TASK: Write the WEEKLY brief for the week ahead. Maximum 950 wo
 
 DAILY_TASK = """TASK: Write the DAILY pre-London-open brief for today. Maximum 650 words. Sections:
 1. TODAY'S EVENTS - one line each: time, currency, event name, then "forecast X vs previous Y" when the calendar gives them, then why it matters for the watch list (say so if there are none).
-2. CENTRAL BANKS AND OVERNIGHT NEWS - what officials said in the FULL TEXT excerpts (with the link for items you rely on) plus the 2 to 4 headlines that matter most, naming sources.
+2. CENTRAL BANKS AND OVERNIGHT NEWS - what officials said in the FULL TEXT excerpts (with the link for items you rely on) plus the 2 to 4 headlines that matter most, naming sources. Group central banks with nothing relevant into one short line.
 3. INSTRUMENTS - """ + INSTRUMENT_FORMAT + """ Keep each driver to one short phrase.
 4. NEWS RISK WINDOWS.
 5. ONE-LINE SUMMARY."""
@@ -791,14 +802,25 @@ def main():
     now = datetime.now(TZ)
     problems = []
 
-    raw = fetch_calendar()
+    raw, calendar_failures = fetch_calendar()
+    problems.extend(calendar_failures)
     if raw:
         chosen = select_events(raw, now)
         print(f"Calendar: {len(raw)} events fetched, {len(chosen)} selected.")
-        calendar_text = format_events(chosen)
+        if chosen:
+            calendar_text = format_events(chosen)
+            if calendar_failures:
+                calendar_text += "\nNOTE: part of the calendar feed could not be loaded, so later events may be missing."
+        elif calendar_failures:
+            calendar_text = (
+                "CALENDAR INCOMPLETE: no events were found in this window and part of the calendar feed "
+                "could not be loaded. Tell the reader the calendar could not be fully checked; "
+                "do not say that no events are scheduled."
+            )
+        else:
+            calendar_text = format_events(chosen)
     else:
         calendar_text = "CALENDAR UNAVAILABLE (fetch failed). Do not guess events."
-        problems.append("economic calendar")
 
     news_text, failed_feeds, official_items = fetch_news(now)
     problems.extend(failed_feeds)
