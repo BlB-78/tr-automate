@@ -235,23 +235,25 @@ def http_get(url, timeout=30, tries=2):
 # ----------------------------------------------------------------- calendar
 
 def fetch_calendar():
-    """Returns (events, failures); a failure reads like 'calendar ff_calendar_nextweek.json (HTTPError 404)'."""
+    """Returns (events, failures); a failure reads like
+    'calendar ff_calendar_nextweek.json (nfs: HTTPError 404; cdn-nfs: ConnectionError)'."""
     events, failures = [], []
     for name, urls in CALENDAR_FILES:
-        last_error = None
+        errors = []
         for url in urls:
+            host = url.split("/")[2].split(".")[0]
             try:
                 data = http_get(url, timeout=30).json()
                 if isinstance(data, list):
                     events.extend(data)
-                    last_error = None
+                    errors = []
                     break
-                last_error = "unexpected format"
+                errors.append(f"{host}: unexpected format")
             except Exception as e:
-                last_error = describe(e)
-                print(f"Calendar fetch failed ({name} on {url.split('/')[2]}): {last_error}", file=sys.stderr)
-        if last_error:
-            failures.append(f"calendar {name} ({last_error})")
+                errors.append(f"{host}: {describe(e)}")
+                print(f"Calendar fetch failed ({name} on {url.split('/')[2]}): {describe(e)}", file=sys.stderr)
+        if errors:
+            failures.append(f"calendar {name} ({'; '.join(errors)})")
     return events, failures
 
 
@@ -625,21 +627,24 @@ NAME - last price; where it sits versus the previous day and previous week (copy
 - Bullish: the driver (from the events, central bank text or news); invalidated below LEVEL
 - Bearish: the driver; invalidated above LEVEL
 - Levels: previous day high / low, previous week high / low
-LEVEL must be copied from KEY PRICE LEVELS: use a previous day or previous week low for the bullish case and a previous day or previous week high for the bearish case.
+LEVEL must be copied from KEY PRICE LEVELS: LEVEL_RULE
 If the data holds no specific driver for a case, write "no specific driver in the data" instead of a generic reason; anything generic must be labelled general context."""
+
+WEEKLY_LEVEL_RULE = "use the previous week low for the bullish case and the previous week high for the bearish case (this is a week-ahead brief)."
+DAILY_LEVEL_RULE = "use the previous day low for the bullish case and the previous day high for the bearish case (this is a daily brief)."
 
 WEEKLY_TASK = """TASK: Write the WEEKLY brief for the week ahead. Maximum 950 words. Sections:
 1. WEEK AHEAD - the 6 to 8 events that matter most. One line each: day, time, currency, event name, then "forecast X vs previous Y" when the calendar gives them, then why it matters for the watch list (what a result above or below forecast would mean for that currency).
 2. CENTRAL BANKS - what officials actually said in the FULL TEXT excerpts: tone (hawkish, dovish or neutral), hints about the rate path, the data they emphasise, anything surprising. Name the institution and add the link for each item you rely on. Central banks with no relevant text: do not give each its own line, list them together in one short line.
 3. NEWS THEMES - 2 to 4 market themes from the headlines, naming the sources.
-4. INSTRUMENTS - """ + INSTRUMENT_FORMAT + """
+4. INSTRUMENTS - """ + INSTRUMENT_FORMAT.replace("LEVEL_RULE", WEEKLY_LEVEL_RULE) + """
 5. NEWS RISK WINDOWS - times to be careful trading, with the event names.
 6. ONE-LINE SUMMARY."""
 
 DAILY_TASK = """TASK: Write the DAILY pre-London-open brief for today. Maximum 650 words. Sections:
 1. TODAY'S EVENTS - one line each: time, currency, event name, then "forecast X vs previous Y" when the calendar gives them, then why it matters for the watch list (say so if there are none).
 2. CENTRAL BANKS AND OVERNIGHT NEWS - what officials said in the FULL TEXT excerpts (with the link for items you rely on) plus the 2 to 4 headlines that matter most, naming sources. Group central banks with nothing relevant into one short line.
-3. INSTRUMENTS - """ + INSTRUMENT_FORMAT + """ Keep each driver to one short phrase.
+3. INSTRUMENTS - """ + INSTRUMENT_FORMAT.replace("LEVEL_RULE", DAILY_LEVEL_RULE) + """ Keep each driver to one short phrase.
 4. NEWS RISK WINDOWS.
 5. ONE-LINE SUMMARY."""
 
@@ -837,10 +842,13 @@ def main():
     problems = []
 
     raw, calendar_failures = fetch_calendar()
-    problems.extend(calendar_failures)
     if raw:
         chosen = select_events(raw, now)
         print(f"Calendar: {len(raw)} events fetched, {len(chosen)} selected.")
+        # The next-week file only matters when the window reaches into next week. A daily brief never needs it,
+        # and on Sunday the this-week file already holds the whole coming week.
+        if MODE == "daily" or (now.weekday() == 6 and chosen):
+            calendar_failures = [f for f in calendar_failures if "nextweek" not in f]
         if chosen:
             calendar_text = format_events(chosen)
             if calendar_failures:
@@ -855,6 +863,7 @@ def main():
             calendar_text = format_events(chosen)
     else:
         calendar_text = "CALENDAR UNAVAILABLE (fetch failed). Do not guess events."
+    problems.extend(calendar_failures)
 
     news_text, failed_feeds, official_items = fetch_news(now)
     problems.extend(failed_feeds)
