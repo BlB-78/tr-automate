@@ -69,6 +69,11 @@ _TEXT = {
         "scheduled": "scheduled run",
         "manual": "manual run",
         "late": "Note: GitHub started this scheduled run {minutes} minutes late.",
+        "prev_day": "previous day",
+        "prev_week": "previous week",
+        "pos_above": "Price is above the {label} high by {x}",
+        "pos_below": "Price is below the {label} low by {x}",
+        "pos_inside": "Price is inside the {label} range",
     },
     "ar": {
         "weekly": "الملخص الأسبوعي",
@@ -84,15 +89,27 @@ _TEXT = {
         "scheduled": "تشغيل مجدول",
         "manual": "تشغيل يدوي",
         "late": "ملاحظة: تأخّر GitHub في بدء هذا التشغيل المجدول {minutes} دقيقة.",
+        "prev_day": "اليوم السابق",
+        "prev_week": "الأسبوع السابق",
+        "pos_above": "السعر أعلى من قمة {label} بمقدار {x}",
+        "pos_below": "السعر أدنى من قاع {label} بمقدار {x}",
+        "pos_inside": "السعر داخل نطاق {label}",
     },
 }
 TEXT = _TEXT[BRIEF_LANGUAGE]
 
 # ------------------------------------------------------------------ sources
 
-CALENDAR_URLS = [
-    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-    "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+# Each calendar file is tried on two hosts: the feed's CDN sometimes lacks the next-week file on one of them.
+CALENDAR_FILES = [
+    ("ff_calendar_thisweek.json", [
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
+    ]),
+    ("ff_calendar_nextweek.json", [
+        "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+        "https://cdn-nfs.faireconomy.media/ff_calendar_nextweek.json",
+    ]),
 ]
 
 # display name -> (list of Yahoo tickers to try in order, decimals)
@@ -220,16 +237,21 @@ def http_get(url, timeout=30, tries=2):
 def fetch_calendar():
     """Returns (events, failures); a failure reads like 'calendar ff_calendar_nextweek.json (HTTPError 404)'."""
     events, failures = [], []
-    for url in CALENDAR_URLS:
-        name = url.rsplit("/", 1)[-1]
-        try:
-            r = http_get(url, timeout=30)
-            data = r.json()
-            if isinstance(data, list):
-                events.extend(data)
-        except Exception as e:
-            print(f"Calendar fetch failed ({name}): {describe(e)}", file=sys.stderr)
-            failures.append(f"calendar {name} ({describe(e)})")
+    for name, urls in CALENDAR_FILES:
+        last_error = None
+        for url in urls:
+            try:
+                data = http_get(url, timeout=30).json()
+                if isinstance(data, list):
+                    events.extend(data)
+                    last_error = None
+                    break
+                last_error = "unexpected format"
+            except Exception as e:
+                last_error = describe(e)
+                print(f"Calendar fetch failed ({name} on {url.split('/')[2]}): {last_error}", file=sys.stderr)
+        if last_error:
+            failures.append(f"calendar {name} ({last_error})")
     return events, failures
 
 
@@ -280,14 +302,15 @@ def format_events(chosen, cap=100):
 # -------------------------------------------------------------------- prices
 
 def where(price, low, high, dp, label):
+    """Where the price sits against a range, worded in the brief's language."""
     if price > high:
-        return f"above the {label} high by {price - high:.{dp}f}"
+        return TEXT["pos_above"].format(label=label, x=f"{price - high:.{dp}f}")
     if price < low:
-        return f"below the {label} low by {low - price:.{dp}f}"
-    return f"inside the {label} range"
+        return TEXT["pos_below"].format(label=label, x=f"{low - price:.{dp}f}")
+    return TEXT["pos_inside"].format(label=label)
 
 
-def format_levels(name, ticker, daily, weekly, dp, today=None):
+def format_levels(name, ticker, daily, weekly, dp, today=None, last_price=None):
     """Key levels worked out here in code (not by the AI): last price, today so far,
     previous day, this week so far and previous week."""
     def f(x):
@@ -295,7 +318,7 @@ def format_levels(name, ticker, daily, weekly, dp, today=None):
 
     tz = daily.index.tz
     today = today or (datetime.now(tz) if tz else datetime.now()).date()
-    price = float(daily["Close"].iloc[-1])
+    price = float(last_price) if last_price is not None else float(daily["Close"].iloc[-1])
 
     live_day = daily.index[-1].date() == today  # the last candle is today's and still forming
     today_row = daily.iloc[-1] if live_day else None
@@ -323,7 +346,7 @@ def format_levels(name, ticker, daily, weekly, dp, today=None):
             f"  Previous day ({daily.index[pd_pos]:%a %d %b}): high {f(prev_day['High'])} | "
             f"low {f(prev_day['Low'])} | close {f(prev_day['Close'])}"
         )
-        lines.append(f"    Price is {where(price, prev_day['Low'], prev_day['High'], dp, 'previous day')}")
+        lines.append(f"    {where(price, prev_day['Low'], prev_day['High'], dp, TEXT['prev_day'])}")
     if this_week is not None:
         lines.append(f"  This week so far: high {f(this_week['High'])} | low {f(this_week['Low'])}")
     if prev_week is not None:
@@ -331,7 +354,7 @@ def format_levels(name, ticker, daily, weekly, dp, today=None):
             f"  Previous week ({prev_week_label}): high {f(prev_week['High'])} | "
             f"low {f(prev_week['Low'])} | close {f(prev_week['Close'])}"
         )
-        lines.append(f"    Price is {where(price, prev_week['Low'], prev_week['High'], dp, 'previous week')}")
+        lines.append(f"    {where(price, prev_week['Low'], prev_week['High'], dp, TEXT['prev_week'])}")
     lines.append("  Last 5 daily closes (oldest to newest): " + ", ".join(f(x) for x in daily["Close"].tail(5)))
     if not weekly.empty:
         lines.append("  Last weekly closes (oldest to newest): " + ", ".join(f(x) for x in weekly["Close"]))
@@ -360,7 +383,17 @@ def fetch_markets():
                 if daily.empty:
                     continue
                 weekly = clean_candles(t.history(period="3mo", interval="1wk")).tail(4)
-                block = format_levels(name, ticker, daily, weekly, dp)
+                last_price = None
+                try:  # the latest hourly close is the last price: it does not depend on how Yahoo cuts daily candles
+                    hourly = t.history(period="5d", interval="1h").dropna()
+                    if not hourly.empty:
+                        last_price = float(hourly["Close"].iloc[-1])
+                except Exception as e:
+                    print(f"Hourly price fetch failed for {ticker}: {describe(e)}", file=sys.stderr)
+                daily_close = float(daily["Close"].iloc[-1])
+                if last_price is not None and abs(last_price - daily_close) / daily_close > 0.001:
+                    print(f"{name}: last hourly close {last_price} differs from daily close {daily_close}", file=sys.stderr)
+                block = format_levels(name, ticker, daily, weekly, dp, last_price=last_price)
                 break
             except Exception as e:
                 print(f"Price fetch failed for {ticker}: {type(e).__name__}", file=sys.stderr)
@@ -585,14 +618,15 @@ RULES = """RULES
 - Output is plain text for Telegram: no markdown symbols (no asterisks, hashes or backticks). Put each section heading on its own line and use "-" bullets."""
 
 LANGUAGE_RULE_AR = """
-- LANGUAGE: write the whole brief in clear Modern Standard Arabic, including the section headings. Keep currency pair names (such as EUR/USD), numbers, clock times, links and source names in Latin characters and digits 0-9. Write day and month names in Arabic. Give each central bank's name in Arabic with its abbreviation in brackets the first time, for example البنك المركزي الأوروبي (ECB)."""
+- LANGUAGE: write the whole brief in clear Modern Standard Arabic, including the section headings. Keep currency pair names (such as EUR/USD), numbers, clock times, links and source names in Latin characters and digits 0-9. Write day and month names in Arabic. Give each central bank's name in Arabic with its abbreviation in brackets the first time, for example البنك المركزي الأوروبي (ECB). Translate every English phrase in the data into Arabic; only pair names, numbers, clock times, links and source names stay in Latin characters. Write "Bullish" as صعودي and "Bearish" as هبوطي; write "invalidated below X" as يُلغى السيناريو عند الهبوط تحت X, and "invalidated above X" as يُلغى السيناريو عند الصعود فوق X."""
 
 INSTRUMENT_FORMAT = """one block per instrument (EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, USD/CAD, NZD/USD, Gold), then one line for the Dollar Index. Use exactly this format for each block:
 NAME - last price; where it sits versus the previous day and previous week (copy from KEY PRICE LEVELS)
 - Bullish: the driver (from the events, central bank text or news); invalidated below LEVEL
 - Bearish: the driver; invalidated above LEVEL
 - Levels: previous day high / low, previous week high / low
-LEVEL must be copied from KEY PRICE LEVELS: use a previous day or previous week low for the bullish case and a previous day or previous week high for the bearish case."""
+LEVEL must be copied from KEY PRICE LEVELS: use a previous day or previous week low for the bullish case and a previous day or previous week high for the bearish case.
+If the data holds no specific driver for a case, write "no specific driver in the data" instead of a generic reason; anything generic must be labelled general context."""
 
 WEEKLY_TASK = """TASK: Write the WEEKLY brief for the week ahead. Maximum 950 words. Sections:
 1. WEEK AHEAD - the 6 to 8 events that matter most. One line each: day, time, currency, event name, then "forecast X vs previous Y" when the calendar gives them, then why it matters for the watch list (what a result above or below forecast would mean for that currency).
