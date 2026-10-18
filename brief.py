@@ -363,10 +363,48 @@ def format_levels(name, ticker, daily, weekly, dp, today=None, last_price=None):
     return "\n".join(lines)
 
 
+NY = ZoneInfo("America/New_York")
+CANDLE_FIELDS = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+
+
 def clean_candles(df):
     """Drop incomplete rows and flat placeholder candles (high equal to low) that Yahoo sometimes adds."""
     df = df.dropna()
     return df[df["High"] > df["Low"]]
+
+
+def ny_close_candles(hourly):
+    """Daily and weekly candles built from hourly bars with the 5 pm New York rollover, which is how most
+    brokers and charting platforms cut FX days. A bar's trading day is its New York time plus 7 hours, so
+    Sunday 17:00 already belongs to Monday and Friday 16:59 is the last minute of Friday."""
+    idx = hourly.index if hourly.index.tz is not None else hourly.index.tz_localize("UTC")
+    bars = hourly[["Open", "High", "Low", "Close"]].copy()
+    bars.index = (idx.tz_convert(NY) + timedelta(hours=7)).tz_localize(None).normalize()
+    bars = bars[bars.index.dayofweek < 5]  # Saturday and Sunday labels are placeholders, not trading days
+    daily = bars.groupby(level=0).agg(CANDLE_FIELDS)
+    weekly = daily.groupby(daily.index.to_period("W").start_time).agg(CANDLE_FIELDS)
+    return daily.tail(12), weekly.tail(5)
+
+
+def levels_from_hourly(t, name, ticker, dp):
+    """Key levels from hourly bars: consistent between runs and independent of how Yahoo cuts its daily candles."""
+    hourly = t.history(period="1mo", interval="1h").dropna().sort_index()
+    if len(hourly) < 24:
+        return None
+    daily, weekly = ny_close_candles(hourly)
+    if daily.empty:
+        return None
+    today = (datetime.now(NY) + timedelta(hours=7)).date()  # today's trading day, same 5 pm New York rule
+    return format_levels(name, ticker, daily, weekly, dp, today=today, last_price=float(hourly["Close"].iloc[-1]))
+
+
+def levels_from_daily(t, name, ticker, dp):
+    """Fallback when hourly data is missing: Yahoo's own daily and weekly candles."""
+    daily = clean_candles(t.history(period="1mo", interval="1d")).tail(10)
+    if daily.empty:
+        return None
+    weekly = clean_candles(t.history(period="3mo", interval="1wk")).tail(4)
+    return format_levels(name, ticker, daily, weekly, dp)
 
 
 def fetch_markets():
@@ -381,24 +419,14 @@ def fetch_markets():
         for ticker in tickers:
             try:
                 t = yf.Ticker(ticker)
-                daily = clean_candles(t.history(period="1mo", interval="1d")).tail(10)
-                if daily.empty:
-                    continue
-                weekly = clean_candles(t.history(period="3mo", interval="1wk")).tail(4)
-                last_price = None
-                try:  # the latest hourly close is the last price: it does not depend on how Yahoo cuts daily candles
-                    hourly = t.history(period="5d", interval="1h").dropna()
-                    if not hourly.empty:
-                        last_price = float(hourly["Close"].iloc[-1])
-                except Exception as e:
-                    print(f"Hourly price fetch failed for {ticker}: {describe(e)}", file=sys.stderr)
-                daily_close = float(daily["Close"].iloc[-1])
-                if last_price is not None and abs(last_price - daily_close) / daily_close > 0.001:
-                    print(f"{name}: last hourly close {last_price} differs from daily close {daily_close}", file=sys.stderr)
-                block = format_levels(name, ticker, daily, weekly, dp, last_price=last_price)
-                break
+                block = levels_from_hourly(t, name, ticker, dp)
+                if block is None:
+                    print(f"{name}: no usable hourly data, using Yahoo's daily candles", file=sys.stderr)
+                    block = levels_from_daily(t, name, ticker, dp)
+                if block:
+                    break
             except Exception as e:
-                print(f"Price fetch failed for {ticker}: {type(e).__name__}", file=sys.stderr)
+                print(f"Price fetch failed for {ticker}: {describe(e)}", file=sys.stderr)
         blocks.append(block or f"{name}: price data unavailable.")
         time.sleep(0.5)  # be gentle with Yahoo
     return "\n\n".join(blocks)
@@ -663,6 +691,53 @@ def build_prompt(now, calendar_text, fulltext_text, news_text, markets_text):
     )
 
 
+# -------------------------------------------------------------- number check
+
+PRICE_NUMBER = re.compile(r"(?<![\d.%])\d{1,5}\.\d{2,5}(?![\d%])")
+
+
+def within_one_edit(a, b):
+    """True when b is a with one character added, dropped or changed."""
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    short, long_ = (a, b) if len(a) < len(b) else (b, a)
+    i = j = 0
+    skipped = False
+    while i < len(short) and j < len(long_):
+        if short[i] == long_[j]:
+            i += 1
+            j += 1
+        elif skipped:
+            return False
+        else:
+            skipped = True
+            j += 1
+    return True
+
+
+def fix_mistyped_numbers(text, trusted_text):
+    """The AI sometimes drops or swaps a digit when it copies a price level (1.12089 became 1.2089).
+    A price-like number that is not in the data but is exactly one typo away from one number that is gets corrected."""
+    trusted = set(PRICE_NUMBER.findall(trusted_text))
+    fixed = []
+
+    def repair(match):
+        token = match.group(0)
+        if token in trusted:
+            return token
+        near = [n for n in trusted if within_one_edit(token, n)]
+        if len(near) == 1:
+            fixed.append((token, near[0]))
+            return near[0]
+        return token
+
+    return PRICE_NUMBER.sub(repair, text), fixed
+
+
 # -------------------------------------------------------------------- Gemini
 
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
@@ -878,6 +953,11 @@ def main():
     print(f"Prompt size: {len(prompt)} characters.")
     try:
         analysis = call_gemini(prompt)
+        analysis, fixed = fix_mistyped_numbers(
+            analysis, "\n".join([markets_text, calendar_text, news_text, fulltext_text])
+        )
+        for bad, good in fixed:
+            print(f"Corrected a mistyped number: {bad} -> {good}")
     except Exception as exc:
         print(f"Gemini failed: {exc}", file=sys.stderr)
         problems.append("Gemini AI summary")
